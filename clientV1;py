@@ -1,0 +1,102 @@
+import socket
+import sys
+
+# --- Configurações do Datalogger ---
+# Este IP é o padrão da ESP32 quando ela cria um Access Point
+ESP32_HOST = "192.168.4.1" 
+ESP32_PORT = 80             # A porta que definimos no firmware
+COMANDO_INICIO = b'S'       # O caractere 'S' (enviado como bytes)
+
+# <<<--- CORREÇÃO AQUI ---<<<
+# Definição das constantes de rede que faltavam
+WIFI_SSID = "ESP32-DATALOGGER" 
+WIFI_SENHA = "senha1234"
+# >>>--- FIM DA CORREÇÃO ---<<<
+
+# --- Configurações do Ensaio (V1.9) ---
+# Deve ser IDÊNTICO ao do firmware!
+FREQ_COLETA_HZ = 2000
+TEMPO_ENSAIO_S = 6
+PONTOS_POR_AMOSTRA = 12000 # (2000 Hz * 6 s)
+BYTES_POR_PONTO = 6      # (1+1+4)
+TAMANHO_ESPERADO_BYTES = PONTOS_POR_AMOSTRA * BYTES_POR_PONTO # 72000 bytes
+
+ARQUIVO_SAIDA = "ensaio.bin" # Nome do arquivo que será salvo no seu PC
+
+def iniciar_ensaio():
+    """
+    Conecta ao datalogger ESP32, envia o comando de início,
+    recebe os dados e os salva em um arquivo binário.
+    """
+    
+    print(f"--- Cliente Datalogger Python (para Firmware V1.9) ---")
+    
+    # 1. Criar o socket TCP
+    # 'with' garante que o socket será fechado mesmo se um erro ocorrer
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            # Definir um timeout de 15 segundos para a conexão e recebimento
+            sock.settimeout(15.0) 
+            
+            # 2. Conectar ao servidor (ESP32)
+            print(f"Conectando a {ESP32_HOST}:{ESP32_PORT}...")
+            sock.connect((ESP32_HOST, ESP32_PORT))
+            print("Conectado! Enviando comando de início...")
+
+            # 3. Enviar o comando de início
+            sock.sendall(COMANDO_INICIO)
+
+            print(f"Comando '{COMANDO_INICIO.decode()}' enviado.")
+            print(f"Aguardando a ESP32 coletar dados por {TEMPO_ENSAIO_S} segundos...")
+            print(f"Esperando receber {TAMANHO_ESPERADO_BYTES / 1024.0:.1f} KB de dados...")
+
+            # 4. Receber os dados
+            # É crucial receber em um loop, pois o TCP pode enviar os 72KB
+            # em vários pacotes pequenos.
+            data_recebida = b''
+            bytes_faltando = TAMANHO_ESPERADO_BYTES
+            
+            while bytes_faltando > 0:
+                # Pede um pedaço dos dados (ex: 4096 bytes de cada vez)
+                chunk = sock.recv(min(bytes_faltando, 4096))
+                
+                if not chunk:
+                    # Ocorreu um erro, a conexão foi fechada antes de receber tudo
+                    raise ConnectionError("Conexão interrompida. Dados incompletos.")
+                
+                data_recebida += chunk
+                bytes_faltando -= len(chunk)
+                
+                # Imprime o progresso na mesma linha
+                print(f"Recebido {len(data_recebida)} de {TAMANHO_ESPERADO_BYTES} bytes...", end='\r')
+
+            print("\n--- Transferência Concluída! ---")
+
+            # 5. Salvar os dados em um arquivo binário
+            if len(data_recebida) == TAMANHO_ESPERADO_BYTES:
+                with open(ARQUIVO_SAIDA, 'wb') as f: # 'wb' = Write Binary
+                    f.write(data_recebida)
+                print(f"Sucesso! Dados salvos em '{ARQUIVO_SAIDA}'")
+                print(f"Tamanho do arquivo: {len(data_recebida)} bytes.")
+            else:
+                print(f"Erro: Recebido {len(data_recebida)} bytes, mas esperava {TAMANHO_ESPERADO_BYTES}.")
+
+        except socket.timeout:
+            print(f"\nErro: Timeout! A ESP32 em {ESP32_HOST} não respondeu.")
+            print("Verifique se você está conectado ao Wi-Fi 'ESP32-DATALOGGER'.")
+        except ConnectionRefusedError:
+            print(f"\nErro: Conexão recusada.")
+            print("Verifique se a ESP32 está ligada e se o IP {ESP32_HOST} está correto.")
+        except Exception as e:
+            print(f"\nOcorreu um erro inesperado: {e}")
+
+# --- Ponto de Entrada Principal ---
+if __name__ == "__main__":
+    print("===================================================================")
+    print("ATENÇÃO: Por favor, conecte-se manualmente à rede Wi-Fi")
+    # Agora esta linha vai funcionar
+    print(f"SSID: '{WIFI_SSID}' (Senha: '{WIFI_SENHA}')")
+    print("===================================================================")
+    input("Pressione ENTER quando estiver conectado...")
+    
+    iniciar_ensaio()
