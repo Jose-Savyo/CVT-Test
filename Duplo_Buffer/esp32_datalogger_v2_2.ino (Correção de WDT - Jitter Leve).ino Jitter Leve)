@@ -1,0 +1,228 @@
+/*
+ * =====================================================================================
+ *
+ * Filename:  esp32_datalogger_v2_2.ino (Correção de WDT / Jitter Leve)
+ *
+ * Descrição:  Firmware V2.2 para Datalogger ESP32.
+ * - Baseado na V2.1 (Duplo Buffer @ 5kHz).
+ * - A V2.1 estava reiniciando devido ao Watchdog Timer (WDT) no Core 0.
+ *
+ * - *** CORREÇÃO CRÍTICA (V2.2) ***
+ * O loop de espera ativa ('while(micros()<...)') na 'taskColetaCore0' (Core 0, Prio Max)
+ * estava consumindo 100% da CPU, impedindo as tarefas do sistema (FreeRTOS)
+ * de rodarem naquele núcleo e alimentarem o WDT.
+ *
+ * - A SOLUÇÃO: Substituir a espera 100% ativa por uma espera que cede controle.
+ * Usamos 'vTaskDelay(pdMS_TO_TICKS(1))' dentro do loop de espera. Isso
+ * coloca a tarefa para dormir por ~1ms se a espera for longa, ou cede
+ * controle brevemente se a espera for curta, permitindo que o sistema
+ * respire e alimente o WDT.
+ *
+ * - EFEITO COLATERAL: Isso introduzirá um pequeno jitter adicional na
+ * frequência de 5kHz (o intervalo não será mais perfeitamente 200µs).
+ * É necessário analisar os dados para verificar se este jitter é aceitável.
+ * Se não for, a solução final é usar Timers de Hardware (V2.3+).
+ *
+ * =====================================================================================
+ */
+
+// --- 1. BIBLIOTECAS ---
+#include <WiFi.h>
+#include "esp_heap_caps.h"
+#include "freertos/queue.h"
+
+// --- 2. ESTRUTURA DE DADOS ---
+struct PontoDeColeta {
+  byte estadoSensor1;
+  byte estadoSensor2;
+  unsigned long timestamp_us;
+} __attribute__((packed)); // 6 bytes exatos
+
+// --- 3. DEFINIÇÕES E CONFIGURAÇÕES ---
+const int FREQ_COLETA_HZ = 5000;
+const long INTERVALO_COLETA_US = 1000000 / FREQ_COLETA_HZ; // 200µs
+const int PONTOS_POR_BUFFER = 2560; 
+const int TAMANHO_UM_BUFFER_BYTES = PONTOS_POR_BUFFER * sizeof(PontoDeColeta); 
+const int SENSOR_PIN_1 = 15;
+const int SENSOR_PIN_2 = 16;
+const int LED_STATUS_PIN = 2;
+const char* WIFI_SSID = "ESP32-DATALOGGER";
+const char* WIFI_SENHA = "senha1234";
+const int TCP_PORTA = 80;
+
+// --- 4. VARIÁVEIS GLOBAIS ---
+PontoDeColeta* g_bufferA;
+PontoDeColeta* g_bufferB;
+enum EstadoSistema { ESTADO_AGUARDANDO_CONEXAO, ESTADO_STREAMING };
+volatile EstadoSistema g_estadoAtual = ESTADO_AGUARDANDO_CONEXAO;
+WiFiServer servidorTCP(TCP_PORTA);
+WiFiClient clienteTCP; 
+TaskHandle_t h_taskColeta; 
+QueueHandle_t filaBuffersProntos; 
+
+// =====================================================================================
+// --- 5. TAREFA DO NÚCLEO 0 (COLETA DE DADOS @ 5kHz - Espera Controlada) ---
+// =====================================================================================
+void taskColetaCore0(void* pvParameters) {
+  Serial.println("Core 0: Tarefa de coleta (ping-pong @ 5kHz vTaskDelay) iniciada.");
+  
+  PontoDeColeta* bufferAtual = g_bufferA;
+  int indiceBuffer = 0;
+  unsigned long tempoProximaColeta; 
+
+  while(g_estadoAtual != ESTADO_STREAMING){
+      vTaskDelay(pdMS_TO_TICKS(100)); 
+  }
+  
+  Serial.println("Core 0: Cliente conectado! Iniciando coleta contínua a 5kHz...");
+  tempoProximaColeta = micros(); 
+
+  for (;;) {
+      // 1. Coleta os dados no buffer atual
+      bufferAtual[indiceBuffer].estadoSensor1 = digitalRead(SENSOR_PIN_1);
+      bufferAtual[indiceBuffer].estadoSensor2 = digitalRead(SENSOR_PIN_2);
+      bufferAtual[indiceBuffer].timestamp_us = micros(); 
+      
+      indiceBuffer++;
+
+      // 2. Verifica se o buffer atual encheu
+      if (indiceBuffer >= PONTOS_POR_BUFFER) {
+          Serial.print("Core 0: Buffer ");
+          Serial.print((bufferAtual == g_bufferA) ? 'A' : 'B');
+          Serial.println(" cheio. Enviando para Core 1.");
+          
+          xQueueSend(filaBuffersProntos, &bufferAtual, 0); 
+          bufferAtual = (bufferAtual == g_bufferA) ? g_bufferB : g_bufferA;
+          indiceBuffer = 0;
+      }
+
+      // --- INÍCIO DA MUDANÇA V2.2 ---
+      // 3. Loop de espera controlada para 5kHz (200µs)
+      tempoProximaColeta += INTERVALO_COLETA_US; 
+      
+      // Espera até o tempo alvo chegar, MAS cede controle periodicamente
+      while (micros() < tempoProximaColeta) {
+        // Cede controle ao sistema operacional por 1 tick (~1ms)
+        // Isso permite que tarefas de fundo (como o WDT) rodem.
+        // Se o tempo restante for < 1ms, ele cederá brevemente e voltará.
+        vTaskDelay(pdMS_TO_TICKS(1)); 
+      }
+      // --- FIM DA MUDANÇA V2.2 ---
+
+
+      // Se o cliente desconectar, pausa a coleta
+       if(g_estadoAtual != ESTADO_STREAMING){
+           Serial.println("Core 0: Cliente desconectou. Pausando coleta.");
+           while(g_estadoAtual != ESTADO_STREAMING){
+               vTaskDelay(pdMS_TO_TICKS(100)); 
+           }
+           Serial.println("Core 0: Cliente reconectou! Retomando coleta...");
+           tempoProximaColeta = micros(); 
+           indiceBuffer = 0; 
+       }
+  }
+}
+
+// =====================================================================================
+// --- 6. FUNÇÕES DE GERENCIAMENTO (NÚCLEO 1 - loop) ---
+// (Sem mudanças)
+// =====================================================================================
+void gerenciarAguardandoConexao() {
+  digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN)); 
+  delay(500);
+  if (clienteTCP && !clienteTCP.connected()) {
+      Serial.println("Core 1 (loop): Cliente anterior desconectado.");
+      clienteTCP.stop(); 
+  }
+  if (!clienteTCP || !clienteTCP.connected()) {
+    clienteTCP = servidorTCP.available();
+    if (clienteTCP && clienteTCP.connected()) {
+      Serial.println("Core 1 (loop): Novo cliente TCP conectado!");
+      Serial.println("Core 1 (loop): Mudando para ESTADO_STREAMING.");
+      digitalWrite(LED_STATUS_PIN, HIGH); 
+      g_estadoAtual = ESTADO_STREAMING; 
+    }
+  }
+}
+
+void gerenciarStreaming() {
+  if (!clienteTCP.connected()) {
+      Serial.println("Core 1 (loop): Cliente desconectou durante streaming.");
+      clienteTCP.stop();
+      g_estadoAtual = ESTADO_AGUARDANDO_CONEXAO; 
+      return;
+  }
+
+  PontoDeColeta* bufferParaEnviar = NULL;
+  if (xQueueReceive(filaBuffersProntos, &bufferParaEnviar, pdMS_TO_TICKS(10)) == pdPASS) {
+      Serial.print("Core 1 (loop): Recebido Buffer ");
+      Serial.print((bufferParaEnviar == g_bufferA) ? 'A' : 'B');
+      Serial.print(". Iniciando envio de ");
+      Serial.print(TAMANHO_UM_BUFFER_BYTES / 1024.0, 1);
+      Serial.println("KB...");
+
+      size_t bytesEnviados = clienteTCP.write((uint8_t*) bufferParaEnviar, TAMANHO_UM_BUFFER_BYTES);
+
+      if (bytesEnviados == TAMANHO_UM_BUFFER_BYTES) {
+          Serial.println("Core 1 (loop): Envio do buffer concluído com sucesso!");
+      } else {
+          Serial.print("Core 1 (loop): Erro no envio do buffer! Enviados ");
+          Serial.print(bytesEnviados); Serial.print(" de "); Serial.println(TAMANHO_UM_BUFFER_BYTES);
+      }
+  }
+}
+
+// =====================================================================================
+// --- 7. SETUP (Executado uma vez no Núcleo 1) ---
+// =====================================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("--- Datalogger ESP32 V2.2 (Correção WDT / 5kHz com Delay) ---");
+  Serial.println("Core 0: Dedicado à Coleta de Dados.");
+  Serial.println("Core 1: Rodando Setup, Loop (Rede/Envio).");
+
+  // Aloca os buffers ANTES do Wi-Fi
+  Serial.print("Core 1: Alocando 2x ");
+  Serial.print(TAMANHO_UM_BUFFER_BYTES / 1024.0, 1);
+  Serial.println("KB de SRAM..."); 
+  g_bufferA = (PontoDeColeta*) heap_caps_malloc(TAMANHO_UM_BUFFER_BYTES, MALLOC_CAP_DMA);
+  g_bufferB = (PontoDeColeta*) heap_caps_malloc(TAMANHO_UM_BUFFER_BYTES, MALLOC_CAP_DMA);
+  if (g_bufferA == NULL || g_bufferB == NULL) {
+    Serial.print("\nFALHA CRITICA! Impossivel alocar os dois buffers.");
+    pinMode(LED_STATUS_PIN, OUTPUT);
+    while (true) { digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN)); delay(50); }
+  }
+  Serial.println("Sucesso! Buffers alocados.");
+
+  pinMode(LED_STATUS_PIN, OUTPUT);
+  pinMode(SENSOR_PIN_1, INPUT_PULLUP);
+  pinMode(SENSOR_PIN_2, INPUT_PULLUP);
+  filaBuffersProntos = xQueueCreate(2, sizeof(PontoDeColeta*)); 
+
+  // Inicia a tarefa de coleta no Core 0, Prio Maxima
+  xTaskCreatePinnedToCore(
+      taskColetaCore0, "TaskColeta", 10000, NULL, configMAX_PRIORITIES - 1, &h_taskColeta, 0);
+  
+  // Configura Wi-Fi e Rede (Core 1)
+  Serial.print("Core 1: Configurando Access Point Wi-Fi...");
+  WiFi.softAP(WIFI_SSID, WIFI_SENHA);
+  Serial.print("OK! IP do AP: "); Serial.println(WiFi.softAPIP());
+  Serial.print("Core 1: Iniciando Servidor TCP na porta "); Serial.println(TCP_PORTA);
+  servidorTCP.begin();
+  Serial.println("\n--- Sistema pronto. Aguardando cliente ---");
+}
+
+// =====================================================================================
+// --- 8. LOOP PRINCIPAL (Executado continuamente no Núcleo 1) ---
+// =====================================================================================
+void loop() {
+  switch (g_estadoAtual) {
+    case ESTADO_AGUARDANDO_CONEXAO:
+      gerenciarAguardandoConexao();
+      break;
+    case ESTADO_STREAMING:
+      gerenciarStreaming();
+      break;
+  }
+}
